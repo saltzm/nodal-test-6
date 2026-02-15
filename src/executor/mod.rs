@@ -1,8 +1,12 @@
 //! Query executor — expression evaluation, result types, and query execution.
 
+use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOperator, Expression, Literal, UnaryOperator};
-use crate::types::{Row, Value};
+use crate::sql::ast::{
+    BinaryOperator, Expression, Literal, SelectColumn, SortDirection, Statement, UnaryOperator,
+};
+use crate::storage::table::TableStorage;
+use crate::types::{Column, Row, Schema, TableDef, Value};
 
 // ───────────────────────── ExecutionResult ─────────────────────────
 
@@ -235,6 +239,439 @@ fn eval_unary_op(op: UnaryOperator, val: &Value) -> Result<Value> {
                 val
             ))),
         },
+    }
+}
+
+// ───────────────────────── Database ─────────────────────────
+
+/// The main database engine. Owns a catalog (in-memory schema info) and
+/// table storage (disk-backed B-tree storage). Provides a high-level
+/// `execute(sql)` interface for running SQL statements.
+pub struct Database {
+    catalog: Catalog,
+    storage: TableStorage,
+    /// Auto-incrementing key counter for inserts.
+    next_id: i64,
+}
+
+impl Database {
+    /// Open (or create) a database at the given path.
+    pub fn open(path: &str, pool_size: usize) -> Result<Self> {
+        let storage = TableStorage::open(path, pool_size)?;
+        Ok(Self {
+            catalog: Catalog::new(),
+            storage,
+            next_id: 1,
+        })
+    }
+
+    /// Parse and execute a SQL statement, returning the result.
+    pub fn execute(&mut self, sql: &str) -> Result<ExecutionResult> {
+        let stmt = crate::sql::parse(sql)?;
+        match stmt {
+            Statement::CreateTable(ct) => self.execute_create_table(ct),
+            Statement::Insert(ins) => self.execute_insert(ins),
+            Statement::Select(sel) => self.execute_select(sel),
+            Statement::Delete(del) => self.execute_delete(del),
+            Statement::Update(upd) => self.execute_update(upd),
+            Statement::Begin | Statement::Commit | Statement::Rollback => {
+                Err(Error::Transaction("not yet implemented".to_string()))
+            }
+        }
+    }
+
+    // ─── CREATE TABLE ───
+
+    fn execute_create_table(
+        &mut self,
+        ct: crate::sql::ast::CreateTable,
+    ) -> Result<ExecutionResult> {
+        // Convert AST ColumnDef list to types::Schema
+        let columns: Vec<Column> = ct
+            .columns
+            .iter()
+            .map(|cd| {
+                Column::new(cd.name.clone(), cd.data_type, cd.nullable)
+            })
+            .collect();
+
+        let schema = Schema::new(columns);
+        let table_def = TableDef::new(ct.name.clone(), schema);
+
+        // Register in catalog
+        self.catalog.create_table(table_def)?;
+
+        // Create storage table
+        self.storage.create_table(&ct.name)?;
+
+        Ok(ExecutionResult::Created)
+    }
+
+    // ─── INSERT ───
+
+    fn execute_insert(
+        &mut self,
+        ins: crate::sql::ast::Insert,
+    ) -> Result<ExecutionResult> {
+        let table_def = self.catalog.get_table(&ins.table)?.clone();
+        let schema = &table_def.schema;
+
+        let mut count = 0;
+
+        for row_exprs in &ins.values {
+            // Evaluate each value expression (using empty column context — these are literals)
+            let empty_cols: Vec<String> = vec![];
+            let empty_row = Row::new(vec![]);
+
+            let values: Vec<Value> = row_exprs
+                .iter()
+                .map(|expr| evaluate_expr(expr, &empty_cols, &empty_row))
+                .collect::<Result<Vec<_>>>()?;
+
+            // If explicit columns are specified, reorder values to match schema order
+            let final_values = if let Some(ref col_names) = ins.columns {
+                let mut ordered = vec![Value::Null; schema.len()];
+                if col_names.len() != values.len() {
+                    return Err(Error::Execution(format!(
+                        "Column count ({}) does not match value count ({})",
+                        col_names.len(),
+                        values.len()
+                    )));
+                }
+                for (i, col_name) in col_names.iter().enumerate() {
+                    let idx = schema.column_index(col_name).ok_or_else(|| {
+                        Error::Execution(format!(
+                            "Column '{}' not found in table '{}'",
+                            col_name, ins.table
+                        ))
+                    })?;
+                    ordered[idx] = values[i].clone();
+                }
+                ordered
+            } else {
+                values
+            };
+
+            let row = Row::new(final_values);
+
+            // Validate row against schema
+            schema.validate_row(&row).map_err(|e| Error::Type(e))?;
+
+            // Use auto-incrementing integer key
+            let key = Value::Integer(self.next_id);
+            self.next_id += 1;
+
+            self.storage.insert_row(&ins.table, key, row)?;
+            count += 1;
+        }
+
+        Ok(ExecutionResult::Inserted { count })
+    }
+
+    // ─── SELECT (single table, no joins/aggregates) ───
+
+    fn execute_select(
+        &mut self,
+        sel: crate::sql::ast::Select,
+    ) -> Result<ExecutionResult> {
+        // Get the table name from FROM clause
+        let from = sel.from.as_ref().ok_or_else(|| {
+            Error::Execution("SELECT without FROM is not supported".to_string())
+        })?;
+
+        if !from.joins.is_empty() {
+            return Err(Error::Execution(
+                "JOINs are not yet supported".to_string(),
+            ));
+        }
+
+        let table_name = &from.table.name;
+        let table_def = self.catalog.get_table(table_name)?.clone();
+        let schema = &table_def.schema;
+
+        // Build column name list from schema
+        let col_names: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        // Scan table
+        let entries = self.storage.scan_table(table_name)?;
+
+        // Apply WHERE filter
+        let mut filtered_rows: Vec<Row> = Vec::new();
+        for (_key, row) in entries {
+            if let Some(ref where_expr) = sel.r#where {
+                let val = evaluate_expr(where_expr, &col_names, &row)?;
+                match val {
+                    Value::Boolean(true) => filtered_rows.push(row),
+                    Value::Boolean(false) | Value::Null => {} // skip
+                    _ => {
+                        return Err(Error::Execution(
+                            "WHERE clause must evaluate to a boolean".to_string(),
+                        ))
+                    }
+                }
+            } else {
+                filtered_rows.push(row);
+            }
+        }
+
+        // Apply ORDER BY (in-memory sort)
+        if !sel.order_by.is_empty() {
+            let order_by = sel.order_by.clone();
+            let col_names_clone = col_names.clone();
+            filtered_rows.sort_by(|a, b| {
+                for ob in &order_by {
+                    let va = evaluate_expr(&ob.expr, &col_names_clone, a)
+                        .unwrap_or(Value::Null);
+                    let vb = evaluate_expr(&ob.expr, &col_names_clone, b)
+                        .unwrap_or(Value::Null);
+                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = match ob.direction {
+                        SortDirection::Ascending => cmp,
+                        SortDirection::Descending => cmp.reverse(),
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Apply LIMIT
+        if let Some(ref limit_expr) = sel.limit {
+            let limit_val =
+                evaluate_expr(limit_expr, &col_names, &Row::new(vec![]))?;
+            if let Value::Integer(n) = limit_val {
+                if n >= 0 {
+                    filtered_rows.truncate(n as usize);
+                }
+            } else {
+                return Err(Error::Execution(
+                    "LIMIT must evaluate to an integer".to_string(),
+                ));
+            }
+        }
+
+        // Check for aggregates — reject for now
+        for sc in &sel.columns {
+            if let SelectColumn::Expression { expr, .. } = sc {
+                if Self::contains_aggregate(expr) {
+                    return Err(Error::Execution(
+                        "Aggregate functions are not yet supported".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Project columns (handle * and named columns)
+        let (result_columns, result_rows) =
+            self.project_columns(&sel.columns, &col_names, &filtered_rows)?;
+
+        Ok(ExecutionResult::Selected {
+            columns: result_columns,
+            rows: result_rows,
+        })
+    }
+
+    /// Check if an expression contains an aggregate function call.
+    fn contains_aggregate(expr: &Expression) -> bool {
+        match expr {
+            Expression::Aggregate { .. } => true,
+            Expression::BinaryOp { left, right, .. } => {
+                Self::contains_aggregate(left) || Self::contains_aggregate(right)
+            }
+            Expression::UnaryOp { operand, .. } => Self::contains_aggregate(operand),
+            _ => false,
+        }
+    }
+
+    /// Project columns from rows based on the SELECT column list.
+    fn project_columns(
+        &self,
+        select_cols: &[SelectColumn],
+        schema_cols: &[String],
+        rows: &[Row],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // Determine output column names and the expressions to evaluate
+        let mut out_col_names: Vec<String> = Vec::new();
+        let mut col_exprs: Vec<Option<Expression>> = Vec::new(); // None means "all columns"
+
+        for sc in select_cols {
+            match sc {
+                SelectColumn::AllColumns => {
+                    for name in schema_cols {
+                        out_col_names.push(name.clone());
+                        col_exprs.push(None);
+                    }
+                }
+                SelectColumn::Expression { expr, alias } => {
+                    let name = if let Some(alias) = alias {
+                        alias.clone()
+                    } else {
+                        Self::expr_display_name(expr)
+                    };
+                    out_col_names.push(name);
+                    col_exprs.push(Some(expr.clone()));
+                }
+            }
+        }
+
+        // Now project each row
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut values = Vec::with_capacity(col_exprs.len());
+            let mut all_col_idx = 0usize;
+            for (i, ce) in col_exprs.iter().enumerate() {
+                match ce {
+                    None => {
+                        // AllColumns — the out_col_names were added in schema order
+                        // Find which schema column index this corresponds to
+                        let col_name = &out_col_names[i];
+                        let idx = schema_cols
+                            .iter()
+                            .position(|c| c == col_name)
+                            .unwrap_or(all_col_idx);
+                        values.push(
+                            row.get(idx).cloned().unwrap_or(Value::Null),
+                        );
+                        all_col_idx += 1;
+                    }
+                    Some(expr) => {
+                        values.push(evaluate_expr(expr, schema_cols, row)?);
+                    }
+                }
+            }
+            result_rows.push(Row::new(values));
+        }
+
+        Ok((out_col_names, result_rows))
+    }
+
+    /// Generate a display name for an expression (used when no alias is given).
+    fn expr_display_name(expr: &Expression) -> String {
+        match expr {
+            Expression::ColumnRef { table: Some(t), column } => {
+                format!("{}.{}", t, column)
+            }
+            Expression::ColumnRef { table: None, column } => column.clone(),
+            Expression::Literal(lit) => format!("{:?}", lit),
+            _ => "?".to_string(),
+        }
+    }
+
+    // ─── DELETE ───
+
+    fn execute_delete(
+        &mut self,
+        del: crate::sql::ast::Delete,
+    ) -> Result<ExecutionResult> {
+        let table_def = self.catalog.get_table(&del.table)?.clone();
+        let schema = &table_def.schema;
+        let col_names: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        // Scan table
+        let entries = self.storage.scan_table(&del.table)?;
+
+        // Find keys to delete
+        let mut keys_to_delete: Vec<Value> = Vec::new();
+        for (key, row) in &entries {
+            if let Some(ref where_expr) = del.r#where {
+                let val = evaluate_expr(where_expr, &col_names, row)?;
+                match val {
+                    Value::Boolean(true) => keys_to_delete.push(key.clone()),
+                    Value::Boolean(false) | Value::Null => {}
+                    _ => {
+                        return Err(Error::Execution(
+                            "WHERE clause must evaluate to a boolean".to_string(),
+                        ))
+                    }
+                }
+            } else {
+                keys_to_delete.push(key.clone());
+            }
+        }
+
+        let count = keys_to_delete.len();
+        for key in &keys_to_delete {
+            self.storage.delete_row(&del.table, key)?;
+        }
+
+        Ok(ExecutionResult::Deleted { count })
+    }
+
+    // ─── UPDATE ───
+
+    fn execute_update(
+        &mut self,
+        upd: crate::sql::ast::Update,
+    ) -> Result<ExecutionResult> {
+        let table_def = self.catalog.get_table(&upd.table)?.clone();
+        let schema = &table_def.schema;
+        let col_names: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        // Scan table
+        let entries = self.storage.scan_table(&upd.table)?;
+
+        // Find rows to update
+        let mut updates: Vec<(Value, Row)> = Vec::new(); // (key, new_row)
+        for (key, row) in &entries {
+            let matches = if let Some(ref where_expr) = upd.r#where {
+                let val = evaluate_expr(where_expr, &col_names, row)?;
+                match val {
+                    Value::Boolean(true) => true,
+                    Value::Boolean(false) | Value::Null => false,
+                    _ => {
+                        return Err(Error::Execution(
+                            "WHERE clause must evaluate to a boolean".to_string(),
+                        ))
+                    }
+                }
+            } else {
+                true
+            };
+
+            if matches {
+                // Apply SET assignments
+                let mut new_values = row.values.clone();
+                for assignment in &upd.assignments {
+                    let col_idx = schema
+                        .column_index(&assignment.column)
+                        .ok_or_else(|| {
+                            Error::Execution(format!(
+                                "Column '{}' not found in table '{}'",
+                                assignment.column, upd.table
+                            ))
+                        })?;
+                    // Evaluate the SET expression using the current row context
+                    let new_val =
+                        evaluate_expr(&assignment.value, &col_names, row)?;
+                    new_values[col_idx] = new_val;
+                }
+                updates.push((key.clone(), Row::new(new_values)));
+            }
+        }
+
+        let count = updates.len();
+
+        // Apply updates via delete + reinsert
+        for (key, new_row) in updates {
+            self.storage.delete_row(&upd.table, &key)?;
+            self.storage.insert_row(&upd.table, key, new_row)?;
+        }
+
+        Ok(ExecutionResult::Updated { count })
     }
 }
 
@@ -932,5 +1369,241 @@ mod tests {
         };
         let result = evaluate_expr(&expr, &[], &Row::new(vec![])).unwrap();
         assert_eq!(result, Value::Null);
+    }
+}
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("toydb_test_executor");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_db_create_table() {
+        let path = temp_db_path("db_create.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        let result = db
+            .execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        assert_eq!(result, ExecutionResult::Created);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_create_duplicate_table() {
+        let path = temp_db_path("db_create_dup.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        let result = db.execute("CREATE TABLE users (id INTEGER)");
+        assert!(result.is_err());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_insert_and_select() {
+        let path = temp_db_path("db_ins_sel.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        let ins = db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        assert_eq!(ins, ExecutionResult::Inserted { count: 1 });
+
+        let sel = db.execute("SELECT * FROM users").unwrap();
+        if let ExecutionResult::Selected { columns, rows } = sel {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Integer(1));
+            assert_eq!(rows[0].values[1], Value::Text("Alice".to_string()));
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_select_with_where() {
+        let path = temp_db_path("db_sel_where.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+
+        let sel = db.execute("SELECT * FROM users WHERE id > 1").unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_select_named_columns() {
+        let path = temp_db_path("db_sel_named.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+            .unwrap();
+
+        let sel = db.execute("SELECT name, age FROM users").unwrap();
+        if let ExecutionResult::Selected { columns, rows } = sel {
+            assert_eq!(columns, vec!["name", "age"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Text("Alice".to_string()));
+            assert_eq!(rows[0].values[1], Value::Integer(30));
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_select_order_by_asc() {
+        let path = temp_db_path("db_sel_ord_asc.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let sel = db
+            .execute("SELECT * FROM users ORDER BY id ASC")
+            .unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].values[0], Value::Integer(1));
+            assert_eq!(rows[1].values[0], Value::Integer(2));
+            assert_eq!(rows[2].values[0], Value::Integer(3));
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_select_order_by_desc() {
+        let path = temp_db_path("db_sel_ord_desc.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let sel = db
+            .execute("SELECT * FROM users ORDER BY id DESC")
+            .unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows[0].values[0], Value::Integer(3));
+            assert_eq!(rows[1].values[0], Value::Integer(2));
+            assert_eq!(rows[2].values[0], Value::Integer(1));
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_select_limit() {
+        let path = temp_db_path("db_sel_limit.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+
+        let sel = db.execute("SELECT * FROM users LIMIT 2").unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_delete() {
+        let path = temp_db_path("db_delete.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+
+        let del = db
+            .execute("DELETE FROM users WHERE id = 2")
+            .unwrap();
+        assert_eq!(del, ExecutionResult::Deleted { count: 1 });
+
+        let sel = db.execute("SELECT * FROM users").unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_update() {
+        let path = temp_db_path("db_update.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let upd = db
+            .execute("UPDATE users SET name = 'Bobby' WHERE id = 2")
+            .unwrap();
+        assert_eq!(upd, ExecutionResult::Updated { count: 1 });
+
+        let sel = db
+            .execute("SELECT * FROM users WHERE id = 2")
+            .unwrap();
+        if let ExecutionResult::Selected { rows, .. } = sel {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[1], Value::Text("Bobby".to_string()));
+        } else {
+            panic!("Expected Selected");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_db_transaction_not_implemented() {
+        let path = temp_db_path("db_txn.db");
+        cleanup(&path);
+        let mut db = Database::open(path.to_str().unwrap(), 100).unwrap();
+        assert!(db.execute("BEGIN").is_err());
+        assert!(db.execute("COMMIT").is_err());
+        assert!(db.execute("ROLLBACK").is_err());
+        cleanup(&path);
     }
 }
