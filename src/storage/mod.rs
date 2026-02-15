@@ -1,6 +1,8 @@
 //! Storage layer — page management, disk I/O, and buffer pool.
 
 pub mod btree;
+#[cfg(test)]
+mod btree_tests;
 pub mod buffer;
 pub mod disk;
 pub mod page;
