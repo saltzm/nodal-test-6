@@ -4,7 +4,7 @@
 //! ensuring durability and enabling crash recovery.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -404,8 +404,127 @@ impl Wal {
     pub fn sync(&mut self) -> Result<()> {
         self.writer.sync()
     }
+
+    /// Truncate the WAL file (discard all records).
+    ///
+    /// Typically called after a successful recovery or checkpoint to reclaim
+    /// space. Re-opens the writer on the now-empty file.
+    pub fn truncate(&mut self) -> Result<()> {
+        // Truncate the file to zero length.
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        drop(file);
+        // Re-open the writer in append mode.
+        self.writer = WalWriter::open(&self.path)?;
+        Ok(())
+    }
 }
 
+
+// ─── Recovery ───
+
+use std::collections::HashSet;
+
+/// Recover a database file using the WAL.
+///
+/// The algorithm uses a two-pass approach:
+///
+/// **Phase 1 (Analysis):** Read all WAL records to determine which
+/// transactions committed. Also collect all write records in WAL order.
+///
+/// **Phase 2 (Redo/Undo):** Replay write records in WAL order.
+/// - For committed transactions: apply after-images (redo).
+/// - For uncommitted/aborted transactions: apply before-images (undo)
+///   in reverse order to restore the original page contents.
+///
+/// Returns `(redo_count, undo_count)` — the number of committed and
+/// uncommitted transactions that had write records.
+pub fn recover(data_path: impl AsRef<Path>, wal_path: impl AsRef<Path>) -> Result<(usize, usize)> {
+    let wal_path = wal_path.as_ref();
+    if !wal_path.exists() {
+        return Ok((0, 0));
+    }
+
+    // Phase 1: Analysis — read all WAL records.
+    let mut reader = WalReader::open(wal_path)?;
+    let mut committed: HashSet<TxnId> = HashSet::new();
+    let mut txns_with_writes: HashSet<TxnId> = HashSet::new();
+    // All write records in WAL order.
+    let mut all_writes: Vec<(TxnId, u32, Box<[u8; PAGE_SIZE]>, Box<[u8; PAGE_SIZE]>)> = Vec::new();
+
+    loop {
+        match reader.next_record() {
+            Ok(Some(record)) => match record {
+                WalRecord::Begin(_) => {}
+                WalRecord::Commit(txn_id) => {
+                    committed.insert(txn_id);
+                }
+                WalRecord::Abort(_) => {
+                    // Explicitly aborted — treated same as uncommitted.
+                }
+                WalRecord::Write {
+                    txn_id,
+                    page_id,
+                    before_image,
+                    after_image,
+                } => {
+                    txns_with_writes.insert(txn_id);
+                    all_writes.push((txn_id, page_id, before_image, after_image));
+                }
+                WalRecord::Checkpoint => {}
+            },
+            Ok(None) => break,
+            Err(_) => {
+                // Truncated/corrupted tail — treat as end-of-log.
+                break;
+            }
+        }
+    }
+
+    // Phase 2: Apply changes to the data file.
+    let mut data_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_path.as_ref())?;
+
+    let mut file_len = data_file.metadata()?.len();
+
+    // Redo: replay committed transaction writes in WAL order.
+    for (txn_id, page_id, _before, after) in &all_writes {
+        if committed.contains(txn_id) {
+            let offset = *page_id as u64 * PAGE_SIZE as u64;
+            if offset + PAGE_SIZE as u64 > file_len {
+                data_file.set_len(offset + PAGE_SIZE as u64)?;
+                file_len = offset + PAGE_SIZE as u64;
+            }
+            data_file.seek(SeekFrom::Start(offset))?;
+            data_file.write_all(after.as_ref())?;
+        }
+    }
+
+    // Undo: replay uncommitted transaction writes in REVERSE order.
+    for (txn_id, page_id, before, _after) in all_writes.iter().rev() {
+        if !committed.contains(txn_id) {
+            let offset = *page_id as u64 * PAGE_SIZE as u64;
+            if offset + PAGE_SIZE as u64 <= file_len {
+                data_file.seek(SeekFrom::Start(offset))?;
+                data_file.write_all(before.as_ref())?;
+            }
+        }
+    }
+
+    data_file.sync_all()?;
+
+    // Count committed/uncommitted transactions that had writes.
+    let redo_count = txns_with_writes.iter().filter(|t| committed.contains(t)).count();
+    let undo_count = txns_with_writes.iter().filter(|t| !committed.contains(t)).count();
+
+    Ok((redo_count, undo_count))
+}
 // ─── Tests ───
 
 #[cfg(test)]
@@ -847,5 +966,573 @@ mod tests {
         }
 
         cleanup(&path);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Recovery tests
+    // ════════════════════════════════════════════════════════════
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("toydb_test_wal_recovery");
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Helper: read a raw page image from a data file.
+    fn read_page_raw(data_path: &Path, page_id: u32) -> [u8; PAGE_SIZE] {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::open(data_path).unwrap();
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        buf
+    }
+
+    /// Helper: write a raw page image to a data file.
+    fn write_page_raw(data_path: &Path, page_id: u32, data: &[u8; PAGE_SIZE]) {
+        use std::io::{Seek, SeekFrom, Write as IoWrite};
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_path)
+            .unwrap();
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let end = offset + PAGE_SIZE as u64;
+        if file.metadata().unwrap().len() < end {
+            file.set_len(end).unwrap();
+        }
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(data).unwrap();
+        file.flush().unwrap();
+    }
+
+    // ── Test 1: Uncommitted transaction changes are NOT applied ──
+
+    #[test]
+    fn test_recover_uncommitted_not_applied() {
+        let db_path = temp_db_path("recover_uncommitted.db");
+        let wal_path_f = temp_db_path("recover_uncommitted.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let original = [0xAAu8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &original);
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            let mut after = [0xBBu8; PAGE_SIZE];
+            after[0] = 0xFF;
+            writer
+                .append(&WalRecord::Write {
+                    txn_id: 1,
+                    page_id: 0,
+                    before_image: Box::new(original),
+                    after_image: Box::new(after),
+                })
+                .unwrap();
+            writer.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 0);
+        assert_eq!(undo, 1);
+
+        let page = read_page_raw(&db_path, 0);
+        assert_eq!(page, original);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 2: Committed transaction changes ARE applied ──
+
+    #[test]
+    fn test_recover_committed_applied() {
+        let db_path = temp_db_path("recover_committed.db");
+        let wal_path_f = temp_db_path("recover_committed.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let original = [0x00u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &original);
+
+        let mut after = [0x00u8; PAGE_SIZE];
+        after[0] = 0xDE;
+        after[1] = 0xAD;
+        after[2] = 0xBE;
+        after[3] = 0xEF;
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer
+                .append(&WalRecord::Write {
+                    txn_id: 1,
+                    page_id: 0,
+                    before_image: Box::new(original),
+                    after_image: Box::new(after),
+                })
+                .unwrap();
+            writer.append(&WalRecord::Commit(1)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 1);
+        assert_eq!(undo, 0);
+
+        let page = read_page_raw(&db_path, 0);
+        assert_eq!(page[0], 0xDE);
+        assert_eq!(page[1], 0xAD);
+        assert_eq!(page[2], 0xBE);
+        assert_eq!(page[3], 0xEF);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 3: Interleaved transactions ──
+
+    #[test]
+    fn test_recover_interleaved_transactions() {
+        let db_path = temp_db_path("recover_interleaved.db");
+        let wal_path_f = temp_db_path("recover_interleaved.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let page0_original = [0x11u8; PAGE_SIZE];
+        let page1_original = [0x22u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &page0_original);
+        write_page_raw(&db_path, 1, &page1_original);
+
+        let page0_after = [0xAAu8; PAGE_SIZE];
+        let page1_after = [0xBBu8; PAGE_SIZE];
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer.append(&WalRecord::Begin(2)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(page0_original),
+                after_image: Box::new(page0_after),
+            }).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 2, page_id: 1,
+                before_image: Box::new(page1_original),
+                after_image: Box::new(page1_after),
+            }).unwrap();
+            writer.append(&WalRecord::Commit(1)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 1);
+        assert_eq!(undo, 1);
+
+        let p0 = read_page_raw(&db_path, 0);
+        assert_eq!(p0, page0_after);
+
+        let p1 = read_page_raw(&db_path, 1);
+        assert_eq!(p1, page1_original);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 4: Recovery is idempotent ──
+
+    #[test]
+    fn test_recover_idempotent() {
+        let db_path = temp_db_path("recover_idempotent.db");
+        let wal_path_f = temp_db_path("recover_idempotent.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let page0_original = [0x00u8; PAGE_SIZE];
+        let page1_original = [0x00u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &page0_original);
+        write_page_raw(&db_path, 1, &page1_original);
+
+        let mut page0_after = [0x00u8; PAGE_SIZE];
+        page0_after[0] = 0xCA;
+        page0_after[1] = 0xFE;
+
+        let mut page1_after = [0x00u8; PAGE_SIZE];
+        page1_after[0] = 0xBA;
+        page1_after[1] = 0xBE;
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(page0_original),
+                after_image: Box::new(page0_after),
+            }).unwrap();
+            writer.append(&WalRecord::Commit(1)).unwrap();
+            writer.append(&WalRecord::Begin(2)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 2, page_id: 1,
+                before_image: Box::new(page1_original),
+                after_image: Box::new(page1_after),
+            }).unwrap();
+            writer.sync().unwrap();
+        }
+
+        // First recovery.
+        let (redo1, undo1) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo1, 1);
+        assert_eq!(undo1, 1);
+
+        let p0_first = read_page_raw(&db_path, 0);
+        let p1_first = read_page_raw(&db_path, 1);
+
+        // Second recovery — same result.
+        let (redo2, undo2) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo2, 1);
+        assert_eq!(undo2, 1);
+
+        let p0_second = read_page_raw(&db_path, 0);
+        let p1_second = read_page_raw(&db_path, 1);
+
+        assert_eq!(p0_first, p0_second);
+        assert_eq!(p1_first, p1_second);
+        assert_eq!(p0_second[0], 0xCA);
+        assert_eq!(p0_second[1], 0xFE);
+        assert_eq!(p1_second, page1_original);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 5: Aborted transaction ──
+
+    #[test]
+    fn test_recover_aborted_transaction() {
+        let db_path = temp_db_path("recover_aborted.db");
+        let wal_path_f = temp_db_path("recover_aborted.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let original = [0x55u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &original);
+
+        let after = [0xFFu8; PAGE_SIZE];
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(original),
+                after_image: Box::new(after),
+            }).unwrap();
+            writer.append(&WalRecord::Abort(1)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 0);
+        assert_eq!(undo, 1);
+
+        let page = read_page_raw(&db_path, 0);
+        assert_eq!(page, original);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 6: Multiple writes in one committed transaction ──
+
+    #[test]
+    fn test_recover_multiple_writes_committed() {
+        let db_path = temp_db_path("recover_multi_write.db");
+        let wal_path_f = temp_db_path("recover_multi_write.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let zero = [0u8; PAGE_SIZE];
+        for i in 0..3u32 {
+            write_page_raw(&db_path, i, &zero);
+        }
+
+        let mut a0 = [0u8; PAGE_SIZE]; a0[0] = 0x10;
+        let mut a1 = [0u8; PAGE_SIZE]; a1[0] = 0x20;
+        let mut a2 = [0u8; PAGE_SIZE]; a2[0] = 0x30;
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(zero), after_image: Box::new(a0),
+            }).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 1,
+                before_image: Box::new(zero), after_image: Box::new(a1),
+            }).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 2,
+                before_image: Box::new(zero), after_image: Box::new(a2),
+            }).unwrap();
+            writer.append(&WalRecord::Commit(1)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 1);
+        assert_eq!(undo, 0);
+
+        assert_eq!(read_page_raw(&db_path, 0)[0], 0x10);
+        assert_eq!(read_page_raw(&db_path, 1)[0], 0x20);
+        assert_eq!(read_page_raw(&db_path, 2)[0], 0x30);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 7: No WAL file ──
+
+    #[test]
+    fn test_recover_no_wal_file() {
+        let db_path = temp_db_path("recover_no_wal.db");
+        let wal_path_f = temp_db_path("recover_no_wal_gone.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let data = [0x42u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &data);
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 0);
+        assert_eq!(undo, 0);
+
+        let page = read_page_raw(&db_path, 0);
+        assert_eq!(page, data);
+
+        cleanup(&db_path);
+    }
+
+    // ── Test 8: Empty WAL file ──
+
+    #[test]
+    fn test_recover_empty_wal() {
+        let db_path = temp_db_path("recover_empty_wal.db");
+        let wal_path_f = temp_db_path("recover_empty_wal.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let data = [0x42u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &data);
+
+        { let _w = WalWriter::open(&wal_path_f).unwrap(); }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 0);
+        assert_eq!(undo, 0);
+
+        let page = read_page_raw(&db_path, 0);
+        assert_eq!(page, data);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 9: WAL truncation ──
+
+    #[test]
+    fn test_wal_truncate() {
+        let path = temp_wal_path("wal_truncate.wal");
+        cleanup(&path);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_begin(1).unwrap();
+            wal.log_write(1, 0, [0u8; PAGE_SIZE], [0xFFu8; PAGE_SIZE]).unwrap();
+            wal.log_commit(1).unwrap();
+
+            let mut reader = wal.reader().unwrap();
+            assert_eq!(reader.read_all().unwrap().len(), 3);
+
+            wal.truncate().unwrap();
+
+            let mut reader = wal.reader().unwrap();
+            assert!(reader.read_all().unwrap().is_empty());
+
+            wal.log_begin(2).unwrap();
+            wal.log_commit(2).unwrap();
+
+            let mut reader = wal.reader().unwrap();
+            let records = reader.read_all().unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0], WalRecord::Begin(2));
+            assert_eq!(records[1], WalRecord::Commit(2));
+        }
+
+        cleanup(&path);
+    }
+
+    // ── Test 10: Checkpoint + truncation after recovery ──
+
+    #[test]
+    fn test_checkpoint_and_truncate_after_recovery() {
+        let db_path = temp_db_path("recover_ckpt_trunc.db");
+        let wal_path_f = temp_db_path("recover_ckpt_trunc.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let original = [0u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &original);
+
+        let mut after = [0u8; PAGE_SIZE];
+        after[0] = 0x77;
+
+        {
+            let mut wal = Wal::open(&wal_path_f).unwrap();
+            wal.log_begin(1).unwrap();
+            wal.log_write(1, 0, original, after).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_checkpoint().unwrap();
+        }
+
+        let (redo, _) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 1);
+        assert_eq!(read_page_raw(&db_path, 0)[0], 0x77);
+
+        {
+            let mut wal = Wal::open(&wal_path_f).unwrap();
+            wal.truncate().unwrap();
+        }
+
+        let (redo2, undo2) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo2, 0);
+        assert_eq!(undo2, 0);
+        assert_eq!(read_page_raw(&db_path, 0)[0], 0x77);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 11: Many interleaved transactions ──
+
+    #[test]
+    fn test_recover_many_interleaved() {
+        let db_path = temp_db_path("recover_many_il.db");
+        let wal_path_f = temp_db_path("recover_many_il.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        for i in 0..4u32 {
+            let mut data = [0u8; PAGE_SIZE];
+            data[0] = i as u8;
+            write_page_raw(&db_path, i, &data);
+        }
+
+        {
+            let mut w = WalWriter::open(&wal_path_f).unwrap();
+            w.append(&WalRecord::Begin(1)).unwrap();
+            w.append(&WalRecord::Begin(2)).unwrap();
+
+            let mut b0 = [0u8; PAGE_SIZE]; b0[0] = 0;
+            let mut a0 = [0u8; PAGE_SIZE]; a0[0] = 0x10;
+            w.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(b0), after_image: Box::new(a0),
+            }).unwrap();
+
+            let mut b1 = [0u8; PAGE_SIZE]; b1[0] = 1;
+            let mut a1 = [0u8; PAGE_SIZE]; a1[0] = 0x11;
+            w.append(&WalRecord::Write {
+                txn_id: 1, page_id: 1,
+                before_image: Box::new(b1), after_image: Box::new(a1),
+            }).unwrap();
+
+            let mut b2 = [0u8; PAGE_SIZE]; b2[0] = 2;
+            let mut a2 = [0u8; PAGE_SIZE]; a2[0] = 0x22;
+            w.append(&WalRecord::Write {
+                txn_id: 2, page_id: 2,
+                before_image: Box::new(b2), after_image: Box::new(a2),
+            }).unwrap();
+
+            let mut b3 = [0u8; PAGE_SIZE]; b3[0] = 3;
+            let mut a3 = [0u8; PAGE_SIZE]; a3[0] = 0x33;
+            w.append(&WalRecord::Write {
+                txn_id: 2, page_id: 3,
+                before_image: Box::new(b3), after_image: Box::new(a3),
+            }).unwrap();
+
+            w.append(&WalRecord::Commit(1)).unwrap();
+
+            // Txn 3: overwrites page 1
+            w.append(&WalRecord::Begin(3)).unwrap();
+            let mut a1_v2 = [0u8; PAGE_SIZE]; a1_v2[0] = 0x99;
+            w.append(&WalRecord::Write {
+                txn_id: 3, page_id: 1,
+                before_image: Box::new(a1), after_image: Box::new(a1_v2),
+            }).unwrap();
+            w.append(&WalRecord::Commit(3)).unwrap();
+            w.sync().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 2);
+        assert_eq!(undo, 1);
+
+        assert_eq!(read_page_raw(&db_path, 0)[0], 0x10);
+        assert_eq!(read_page_raw(&db_path, 1)[0], 0x99);
+        assert_eq!(read_page_raw(&db_path, 2)[0], 2);
+        assert_eq!(read_page_raw(&db_path, 3)[0], 3);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+    }
+
+    // ── Test 12: Truncated WAL tail (crash mid-write) ──
+
+    #[test]
+    fn test_recover_truncated_wal_tail() {
+        let db_path = temp_db_path("recover_trunc_tail.db");
+        let wal_path_f = temp_db_path("recover_trunc_tail.wal");
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
+
+        let original = [0u8; PAGE_SIZE];
+        write_page_raw(&db_path, 0, &original);
+
+        let mut after = [0u8; PAGE_SIZE];
+        after[0] = 0xEE;
+
+        {
+            let mut writer = WalWriter::open(&wal_path_f).unwrap();
+            writer.append(&WalRecord::Begin(1)).unwrap();
+            writer.append(&WalRecord::Write {
+                txn_id: 1, page_id: 0,
+                before_image: Box::new(original),
+                after_image: Box::new(after),
+            }).unwrap();
+            writer.append(&WalRecord::Commit(1)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        // Append garbage (partial record).
+        {
+            use std::io::Write as IoWrite;
+            let mut file = OpenOptions::new().append(true).open(&wal_path_f).unwrap();
+            file.write_all(&1000u32.to_le_bytes()).unwrap();
+            file.write_all(b"garbage").unwrap();
+            file.flush().unwrap();
+        }
+
+        let (redo, undo) = super::recover(&db_path, &wal_path_f).unwrap();
+        assert_eq!(redo, 1);
+        assert_eq!(undo, 0);
+        assert_eq!(read_page_raw(&db_path, 0)[0], 0xEE);
+
+        cleanup(&db_path);
+        cleanup(&wal_path_f);
     }
 }
