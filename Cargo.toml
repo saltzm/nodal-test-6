@@ -1,0 +1,13 @@
+[package]
+name = "toydb"
+version = "0.1.0"
+edition = "2021"
+description = "A toy relational database built from scratch in Rust"
+
+[[bin]]
+name = "toydb"
+path = "src/main.rs"
+
+[lib]
+name = "toydb"
+path = "src/lib.rs"
