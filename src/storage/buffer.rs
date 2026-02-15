@@ -2,17 +2,25 @@
 //!
 //! The buffer pool sits between the executor/B-tree and the disk manager,
 //! reducing I/O by keeping frequently-accessed pages in memory.
+//!
+//! When a WAL is attached (via [`BufferPool::new_with_wal`]), every dirty-page
+//! flush is preceded by a WAL write record containing the before and after
+//! images, implementing the WAL protocol (write-ahead logging).
 
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::storage::disk::DiskManager;
-use crate::storage::page::{Page, PageId, PageType};
+use crate::storage::page::{Page, PageId, PageType, PAGE_SIZE};
+use crate::storage::wal::Wal;
 
 /// A frame in the buffer pool holding a cached page.
 struct Frame {
     page: Page,
     dirty: bool,
+    /// The on-disk image at the time the page was loaded or last flushed.
+    /// Used as the "before image" for WAL records.
+    clean_image: [u8; PAGE_SIZE],
 }
 
 /// An LRU-evicting buffer pool that caches pages from a `DiskManager`.
@@ -26,10 +34,14 @@ pub struct BufferPool {
     /// LRU order: most-recently-used at the back, least-recently-used at the front.
     /// Contains page IDs currently in the buffer pool.
     lru_order: Vec<PageId>,
+    /// Optional WAL for write-ahead logging.
+    wal: Option<Wal>,
+    /// Transaction ID to tag WAL records with. Defaults to 0 (implicit txn).
+    current_txn_id: u64,
 }
 
 impl BufferPool {
-    /// Create a new buffer pool wrapping the given disk manager.
+    /// Create a new buffer pool wrapping the given disk manager (no WAL).
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
         assert!(capacity > 0, "Buffer pool capacity must be > 0");
         Self {
@@ -37,7 +49,45 @@ impl BufferPool {
             capacity,
             frames: HashMap::new(),
             lru_order: Vec::new(),
+            wal: None,
+            current_txn_id: 0,
         }
+    }
+
+    /// Create a new buffer pool with WAL integration.
+    ///
+    /// When a WAL is present, every dirty page flush writes a WAL record
+    /// (with before/after images) before writing the page to the data file.
+    pub fn new_with_wal(disk: DiskManager, capacity: usize, wal: Wal) -> Self {
+        assert!(capacity > 0, "Buffer pool capacity must be > 0");
+        Self {
+            disk,
+            capacity,
+            frames: HashMap::new(),
+            lru_order: Vec::new(),
+            wal: Some(wal),
+            current_txn_id: 0,
+        }
+    }
+
+    /// Set the current transaction ID for WAL records.
+    pub fn set_txn_id(&mut self, txn_id: u64) {
+        self.current_txn_id = txn_id;
+    }
+
+    /// Return the current transaction ID.
+    pub fn txn_id(&self) -> u64 {
+        self.current_txn_id
+    }
+
+    /// Return a reference to the WAL, if present.
+    pub fn wal(&self) -> Option<&Wal> {
+        self.wal.as_ref()
+    }
+
+    /// Return a mutable reference to the WAL, if present.
+    pub fn wal_mut(&mut self) -> Option<&mut Wal> {
+        self.wal.as_mut()
     }
 
     /// Fetch a page by ID. Returns a clone of the cached page.
@@ -53,11 +103,13 @@ impl BufferPool {
         self.ensure_space()?;
 
         let page = self.disk.read_page(page_id)?;
+        let clean_image = page.serialize();
         self.frames.insert(
             page_id,
             Frame {
                 page: page.clone(),
                 dirty: false,
+                clean_image,
             },
         );
         self.lru_order.push(page_id);
@@ -71,11 +123,13 @@ impl BufferPool {
 
         let page = self.disk.allocate_page(page_type)?;
         let page_id = page.id;
+        let clean_image = page.serialize();
         self.frames.insert(
             page_id,
             Frame {
                 page: page.clone(),
                 dirty: false,
+                clean_image,
             },
         );
         self.lru_order.push(page_id);
@@ -101,10 +155,25 @@ impl BufferPool {
     }
 
     /// Flush a specific page to disk if it is dirty.
+    ///
+    /// If a WAL is attached, a write record (before/after images) is logged
+    /// to the WAL before the page is written to the data file.
     pub fn flush_page(&mut self, page_id: PageId) -> Result<()> {
         if let Some(frame) = self.frames.get_mut(&page_id) {
             if frame.dirty {
+                let after_image = frame.page.serialize();
+                // WAL: log before writing the data page.
+                if let Some(ref mut wal) = self.wal {
+                    wal.log_write(
+                        self.current_txn_id,
+                        page_id,
+                        frame.clean_image,
+                        after_image,
+                    )?;
+                }
                 self.disk.write_page(&frame.page)?;
+                // Update clean image to the freshly-flushed state.
+                frame.clean_image = after_image;
                 frame.dirty = false;
             }
             Ok(())
@@ -115,6 +184,9 @@ impl BufferPool {
     }
 
     /// Flush all dirty pages to disk.
+    ///
+    /// If a WAL is attached, the flush is wrapped in a Begin/Commit
+    /// transaction so that recovery can tell which writes are durable.
     pub fn flush_all(&mut self) -> Result<()> {
         // Collect dirty page IDs first to avoid borrow issues.
         let dirty_ids: Vec<PageId> = self
@@ -123,24 +195,59 @@ impl BufferPool {
             .filter(|(_, f)| f.dirty)
             .map(|(&id, _)| id)
             .collect();
-        for id in dirty_ids {
-            let frame = self.frames.get(&id).unwrap();
-            self.disk.write_page(&frame.page)?;
-            self.frames.get_mut(&id).unwrap().dirty = false;
+
+        if dirty_ids.is_empty() {
+            return Ok(());
         }
+
+        let txn_id = self.current_txn_id;
+
+        // WAL: log Begin before any writes.
+        if let Some(ref mut wal) = self.wal {
+            wal.log_begin(txn_id)?;
+        }
+
+        for id in dirty_ids {
+            self.flush_page(id)?;
+        }
+
+        // WAL: log Commit after all writes succeed.
+        if let Some(ref mut wal) = self.wal {
+            wal.log_commit(txn_id)?;
+        }
+
         self.disk.sync()?;
+
+        // Bump txn_id for the next flush batch.
+        self.current_txn_id += 1;
+
         Ok(())
     }
 
     /// Evict a specific page from the pool. Flushes if dirty.
+    ///
+    /// If a WAL is attached, the eviction flush is wrapped in its own
+    /// Begin/Commit WAL transaction.
     pub fn evict_page(&mut self, page_id: PageId) -> Result<()> {
-        if let Some(frame) = self.frames.get(&page_id) {
-            if frame.dirty {
-                self.disk.write_page(&frame.page)?;
+        let needs_flush = self
+            .frames
+            .get(&page_id)
+            .map(|f| f.dirty)
+            .unwrap_or(false);
+        if needs_flush {
+            let txn_id = self.current_txn_id;
+            if let Some(ref mut wal) = self.wal {
+                wal.log_begin(txn_id)?;
             }
-            self.frames.remove(&page_id);
-            self.lru_order.retain(|&id| id != page_id);
+            // flush_page handles WAL write record + disk write.
+            self.flush_page(page_id)?;
+            if let Some(ref mut wal) = self.wal {
+                wal.log_commit(txn_id)?;
+            }
+            self.current_txn_id += 1;
         }
+        self.frames.remove(&page_id);
+        self.lru_order.retain(|&id| id != page_id);
         Ok(())
     }
 

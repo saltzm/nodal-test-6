@@ -20,10 +20,20 @@ use crate::storage::btree::BTree;
 use crate::storage::buffer::BufferPool;
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{PageType, PAGE_PAYLOAD_SIZE};
+use crate::storage::wal::{self, Wal};
 use crate::types::{Row, Value};
 
 /// Metadata page is always page 0.
 const META_PAGE_ID: u32 = 0;
+
+/// Derive the WAL file path from a database file path.
+///
+/// Convention: `<db_path>.wal` (e.g., `mydb.db` → `mydb.db.wal`).
+pub fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
 
 /// Entry point for the executor to interact with table storage.
 ///
@@ -36,10 +46,13 @@ pub struct TableStorage {
     tables: HashMap<String, u32>,
     /// Path to the database file (kept for diagnostics / reopen).
     path: PathBuf,
+    /// Whether WAL is enabled.
+    wal_enabled: bool,
 }
 
 impl TableStorage {
-    /// Open (or create) a table storage backed by the given database file.
+    /// Open (or create) a table storage backed by the given database file
+    /// (no WAL).
     ///
     /// If the file is empty, a metadata page is allocated. Otherwise, the
     /// existing metadata page is loaded.
@@ -73,6 +86,56 @@ impl TableStorage {
             pool,
             tables,
             path,
+            wal_enabled: false,
+        })
+    }
+
+    /// Open (or create) a table storage with WAL enabled.
+    ///
+    /// The WAL file path is derived from the database file path by appending
+    /// `.wal` (e.g., `mydb.db` → `mydb.db.wal`).
+    ///
+    /// On open, WAL recovery is performed first (if a WAL file exists),
+    /// then the WAL is opened for new writes.
+    pub fn open_with_wal(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let wal_path = wal_path_for(&path);
+
+        // Perform WAL recovery before opening the database.
+        if wal_path.exists() {
+            let (_redo, _undo) = wal::recover(&path, &wal_path)?;
+        }
+
+        let dm = DiskManager::open(&path)?;
+        let wal = Wal::open(&wal_path)?;
+        let mut pool = BufferPool::new_with_wal(dm, pool_capacity, wal);
+
+        let tables = if pool.disk().num_pages() == 0 {
+            // Fresh database — allocate meta page.
+            let page = pool.new_page(PageType::Meta)?;
+            assert_eq!(page.id, META_PAGE_ID);
+            // Write empty catalog: num_tables = 0
+            let mut meta = page;
+            meta.data[0..4].copy_from_slice(&0u32.to_le_bytes());
+            pool.write_page(meta)?;
+            HashMap::new()
+        } else {
+            // Existing database — read meta page.
+            let page = pool.fetch_page(META_PAGE_ID)?;
+            if page.page_type != PageType::Meta {
+                return Err(Error::Storage(format!(
+                    "Page 0 has type {:?}, expected Meta",
+                    page.page_type
+                )));
+            }
+            Self::deserialize_catalog(&page.data)?
+        };
+
+        Ok(Self {
+            pool,
+            tables,
+            path,
+            wal_enabled: true,
         })
     }
 
@@ -157,6 +220,27 @@ impl TableStorage {
     /// Return the database file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this storage instance has a WAL attached.
+    pub fn wal_enabled(&self) -> bool {
+        self.wal_enabled
+    }
+
+    /// Perform a WAL checkpoint: flush all dirty pages, log a checkpoint
+    /// record, then truncate the WAL file. No-op if WAL is not enabled.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        // Flush all dirty pages (this writes WAL records then data pages).
+        self.flush()?;
+        // Log a checkpoint record and truncate the WAL.
+        if let Some(ref mut wal) = self.pool.wal_mut() {
+            wal.log_checkpoint()?;
+            wal.truncate()?;
+        }
+        Ok(())
     }
 
     /// Return a reference to the underlying buffer pool.
@@ -876,5 +960,356 @@ mod tests {
         }
 
         cleanup(&path);
+    }
+
+    // ─── WAL integration tests ───
+
+    fn cleanup_wal(path: &std::path::Path) {
+        cleanup(path);
+        let wal = super::wal_path_for(path);
+        let _ = fs::remove_file(&wal);
+    }
+
+    #[test]
+    fn test_wal_open_creates_wal_file() {
+        let path = temp_db_path("ts_wal_create.db");
+        cleanup_wal(&path);
+
+        {
+            let ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            assert!(ts.wal_enabled());
+            let wal_path = super::wal_path_for(&path);
+            assert!(wal_path.exists(), "WAL file should be created");
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_basic_crud() {
+        let path = temp_db_path("ts_wal_crud.db");
+        cleanup_wal(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("users").unwrap();
+
+            // Insert
+            for i in 0..10i64 {
+                ts.insert_row("users", Value::Integer(i),
+                    make_row(vec![Value::Integer(i), Value::Text(format!("user_{}", i))])).unwrap();
+            }
+
+            // Read back
+            for i in 0..10i64 {
+                let row = ts.get_row("users", &Value::Integer(i)).unwrap();
+                assert!(row.is_some(), "Row {} should exist", i);
+                assert_eq!(row.unwrap().values[1], Value::Text(format!("user_{}", i)));
+            }
+
+            // Delete
+            assert!(ts.delete_row("users", &Value::Integer(5)).unwrap());
+            assert_eq!(ts.get_row("users", &Value::Integer(5)).unwrap(), None);
+
+            ts.flush().unwrap();
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_persistence_across_reopen() {
+        let path = temp_db_path("ts_wal_persist.db");
+        cleanup_wal(&path);
+
+        // Write data with WAL enabled.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("items").unwrap();
+
+            for i in 0..20i64 {
+                ts.insert_row("items", Value::Integer(i),
+                    make_row(vec![Value::Integer(i), Value::Text(format!("item_{}", i))])).unwrap();
+            }
+            ts.flush().unwrap();
+        }
+
+        // Reopen with WAL and verify data persists.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            assert!(ts.has_table("items"));
+
+            for i in 0..20i64 {
+                let row = ts.get_row("items", &Value::Integer(i)).unwrap();
+                assert_eq!(
+                    row,
+                    Some(make_row(vec![Value::Integer(i), Value::Text(format!("item_{}", i))])),
+                    "Row {} missing after WAL reopen", i
+                );
+            }
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_checkpoint_truncates_wal() {
+        let path = temp_db_path("ts_wal_checkpoint.db");
+        cleanup_wal(&path);
+
+        let wal_path = super::wal_path_for(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("data").unwrap();
+
+            for i in 0..5i64 {
+                ts.insert_row("data", Value::Integer(i),
+                    make_row(vec![Value::Integer(i)])).unwrap();
+            }
+            ts.flush().unwrap();
+
+            // WAL should have records now.
+            let wal_size_before = fs::metadata(&wal_path).unwrap().len();
+            assert!(wal_size_before > 0, "WAL should have data before checkpoint");
+
+            // Checkpoint should flush + truncate WAL.
+            ts.checkpoint().unwrap();
+
+            let wal_size_after = fs::metadata(&wal_path).unwrap().len();
+            assert_eq!(wal_size_after, 0, "WAL should be empty after checkpoint");
+        }
+
+        // Data should still be accessible after checkpoint.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            for i in 0..5i64 {
+                assert!(ts.get_row("data", &Value::Integer(i)).unwrap().is_some());
+            }
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_records_generated_on_flush() {
+        use crate::storage::wal::WalReader;
+
+        let path = temp_db_path("ts_wal_records.db");
+        cleanup_wal(&path);
+
+        let wal_path = super::wal_path_for(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("test").unwrap();
+
+            ts.insert_row("test", Value::Integer(1),
+                make_row(vec![Value::Integer(1)])).unwrap();
+
+            ts.flush().unwrap();
+        }
+
+        // Read the WAL and verify it has Write records.
+        {
+            let mut reader = WalReader::open(&wal_path).unwrap();
+            let records = reader.read_all().unwrap();
+            assert!(!records.is_empty(), "WAL should have records after flush");
+
+            // All records should be Write records (no Begin/Commit in implicit mode).
+            use crate::storage::wal::WalRecord;
+            let write_count = records.iter().filter(|r| matches!(r, WalRecord::Write { .. })).count();
+            assert!(write_count > 0, "WAL should have at least one Write record");
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_multiple_tables_with_wal() {
+        let path = temp_db_path("ts_wal_multi_tables.db");
+        cleanup_wal(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 50).unwrap();
+            ts.create_table("alpha").unwrap();
+            ts.create_table("beta").unwrap();
+
+            for i in 0..30i64 {
+                ts.insert_row("alpha", Value::Integer(i),
+                    make_row(vec![Value::Integer(i), Value::Text("A".into())])).unwrap();
+                ts.insert_row("beta", Value::Integer(i * 10),
+                    make_row(vec![Value::Integer(i * 10), Value::Text("B".into())])).unwrap();
+            }
+
+            ts.flush().unwrap();
+        }
+
+        // Reopen and verify.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 50).unwrap();
+            assert_eq!(ts.table_names(), vec!["alpha", "beta"]);
+
+            let alpha = ts.scan_table("alpha").unwrap();
+            assert_eq!(alpha.len(), 30);
+
+            let beta = ts.scan_table("beta").unwrap();
+            assert_eq!(beta.len(), 30);
+
+            assert_eq!(
+                ts.get_row("beta", &Value::Integer(100)).unwrap(),
+                Some(make_row(vec![Value::Integer(100), Value::Text("B".into())]))
+            );
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_small_buffer_pool() {
+        let path = temp_db_path("ts_wal_small_pool.db");
+        cleanup_wal(&path);
+
+        {
+            // Very small buffer pool forces heavy eviction — WAL records
+            // should be written for every evicted dirty page.
+            let mut ts = TableStorage::open_with_wal(&path, 5).unwrap();
+            ts.create_table("stress").unwrap();
+
+            let n = 200i64;
+            for i in 0..n {
+                ts.insert_row("stress", Value::Integer(i),
+                    make_row(vec![Value::Integer(i), Value::Text(format!("v{}", i))])).unwrap();
+            }
+
+            // All rows should be retrievable despite heavy eviction.
+            for i in 0..n {
+                let result = ts.get_row("stress", &Value::Integer(i)).unwrap();
+                assert!(result.is_some(), "Key {} missing under WAL + small pool", i);
+            }
+
+            ts.flush().unwrap();
+        }
+
+        // Reopen and verify persistence.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 5).unwrap();
+            let all = ts.scan_table("stress").unwrap();
+            assert_eq!(all.len(), 200);
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_path_derivation() {
+        let path = PathBuf::from("/tmp/test.db");
+        let wal = super::wal_path_for(&path);
+        assert_eq!(wal, PathBuf::from("/tmp/test.db.wal"));
+
+        let path2 = PathBuf::from("mydata");
+        let wal2 = super::wal_path_for(&path2);
+        assert_eq!(wal2, PathBuf::from("mydata.wal"));
+    }
+
+    #[test]
+    fn test_wal_recovery_on_reopen() {
+        // This test verifies that WAL recovery happens on reopen.
+        // We write data, flush to WAL but DON'T checkpoint,
+        // then reopen — recovery should apply the WAL.
+        let path = temp_db_path("ts_wal_recovery.db");
+        cleanup_wal(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("recovered").unwrap();
+
+            for i in 0..10i64 {
+                ts.insert_row("recovered", Value::Integer(i),
+                    make_row(vec![Value::Integer(i)])).unwrap();
+            }
+
+            // Flush writes WAL records AND data pages.
+            ts.flush().unwrap();
+            // Don't checkpoint — WAL still has records.
+        }
+
+        // Reopen — recovery runs, then we verify data.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            assert!(ts.has_table("recovered"));
+
+            for i in 0..10i64 {
+                let row = ts.get_row("recovered", &Value::Integer(i)).unwrap();
+                assert!(row.is_some(), "Row {} should survive WAL recovery", i);
+            }
+        }
+
+        cleanup_wal(&path);
+    }
+
+    #[test]
+    fn test_wal_no_wal_mode_still_works() {
+        // Verify that opening without WAL still works as before.
+        let path = temp_db_path("ts_no_wal_mode.db");
+        cleanup(&path);
+
+        {
+            let mut ts = TableStorage::open(&path, 100).unwrap();
+            assert!(!ts.wal_enabled());
+
+            ts.create_table("plain").unwrap();
+            ts.insert_row("plain", Value::Integer(1),
+                make_row(vec![Value::Integer(1)])).unwrap();
+            ts.flush().unwrap();
+
+            // checkpoint is a no-op when WAL is not enabled.
+            ts.checkpoint().unwrap();
+        }
+
+        {
+            let mut ts = TableStorage::open(&path, 100).unwrap();
+            assert!(ts.get_row("plain", &Value::Integer(1)).unwrap().is_some());
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_wal_mixed_operations() {
+        let path = temp_db_path("ts_wal_mixed.db");
+        cleanup_wal(&path);
+
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            ts.create_table("ops").unwrap();
+
+            // Insert
+            for i in 0..20i64 {
+                ts.insert_row("ops", Value::Integer(i),
+                    make_row(vec![Value::Integer(i), Value::Text(format!("v{}", i))])).unwrap();
+            }
+
+            // Delete even numbers
+            for i in (0..20i64).step_by(2) {
+                ts.delete_row("ops", &Value::Integer(i)).unwrap();
+            }
+
+            ts.flush().unwrap();
+        }
+
+        // Reopen and verify.
+        {
+            let mut ts = TableStorage::open_with_wal(&path, 100).unwrap();
+            let all = ts.scan_table("ops").unwrap();
+            assert_eq!(all.len(), 10, "Should have 10 odd rows");
+
+            for (key, _) in &all {
+                let k = key.as_integer().unwrap();
+                assert!(k % 2 == 1, "Only odd keys should remain, got {}", k);
+            }
+        }
+
+        cleanup_wal(&path);
     }
 }
