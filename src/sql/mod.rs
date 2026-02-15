@@ -1,2 +1,6 @@
 //! SQL parser and AST definitions.
-//! (To be implemented in a later step.)
+
+pub mod ast;
+
+// Re-export all AST types for convenient access.
+pub use ast::*;
